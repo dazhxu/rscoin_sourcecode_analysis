@@ -232,7 +232,7 @@ local("python estthroughput.py %s > %s/state.txt" % (env.expname, env.expname))
 
 即在本地执行实验I的内容，但发行数为1000
 
-## 实验三
+## 实验III
 
 测试remitte的数量对系统影响的继承测试。
 
