@@ -204,3 +204,262 @@ reactor.stop()
 
 ## broadcast方法
 
+向mintette广播数据。
+
+参数：
+
+- small_dir: (kid, ip, port)的集合
+- data：数据
+
+定义gotProtocol方法，发送数据
+
+```python
+def gotProtocol(p):
+	p.sendLine(data)
+```
+
+对于small_dir中的每个条目创建连接，发送数据
+
+```python
+for (kid, ip, port) in small_dir:
+	_stats[ip] += 1
+	point = TCP4ClientEndpoint(reactor, ip, int(port), timeout=10)
+	f = RSCfactory()
+
+	d = point.connect(f)
+	d.addCallback(gotProtocol)
+	d.addErrback(f.d.errback)
+	d_list += [f.d]
+```
+
+最后异步收集结果
+
+```python
+d_all = defer.gatherResults(d_list)
+```
+
+## play方法
+
+play方法执行具体的交易。
+
+参数：
+
+- core: 交易内容
+- directory：(kid, ip, port)的列表
+
+从交易中获取input
+
+```python
+tx = rscoin.Tx.parse(b64decode(core[0]))
+inTxo = tx.get_utxo_in_keys()
+```
+
+检查至少有一个Input由此服务器持有
+
+```python
+Qauths = []
+for ik in inTxo:
+	Qauths += get_authorities(diretory, ik, 3)
+Qauths = set(Qauths)
+Qsmall_dir = [(kid, ip, port) for (kid, ip, port) in diretory if kid in Qauths]
+```
+
+检查tx.id所在的服务器
+
+```python
+Cauths_L = get_authorities(directory, tx.id(), N=3)
+Cauths = set(Cauths_L)
+
+assert len(Cauths) == len(Cauths_L)
+assert len(Cauths) <= 3
+
+Csmall_dir = [(kid, ip, port) for (kid, ip, port) in directory if kid in Cauths]
+
+assert len(Csmall_dir) <= 3
+```
+
+创建defer对象和回调函数
+
+```python
+d_end = defere.Deferred()
+def get_commit_response(resp):
+	try:
+		assert len(resp) <= 3
+		for r in resp:
+			res = unpackage_commit_response(r)
+			if res[0] != "OK":
+				print resp
+				d_end.errback(Exception("Commit failed."))
+				return
+		d_end.callback(t1 - t0)
+	except Exception as e:
+		d_end.callback(t1 - t0)
+		return
+```
+
+如果是issue消息
+
+```python
+if len(tx.inTx) == 0:
+	c_msg = " ".join(["xCommit", str(len(core))] + core)
+	d = broadcast(Csmall_dir, c_msg)
+	d.addCallback(get_commit_responses)
+	d.addErrback(d_end.errback)
+```
+
+如果是查询交易，先收集签名，再提交交易
+
+```python
+q_msg = " ".join(["xQuery", str(len(core))] + core)
+d = broadcast(Qsmall_dir, q_msg)
+def process_query_response(resp):
+	try:
+		kss = []
+		for r in resp:
+			res = unpackage_query_response(r)
+			if res[0] != "OK":
+				print resp
+				d_end.errback(Exception("Query failed."))
+				return
+			_, k, s = res
+			kss += [(k, s)]
+		commit_message = package_commit(core, kss)
+		dx = broadcast(Csmall_dir, commit_message)
+		dx.addCallback(get_commit_responses)
+		dx.addErrback(d_end.errback)
+	except Exception as e:
+		d_end.errback(e)
+
+d.addCallback(process_query_response)
+d.addErrback(d_end.errback)
+```
+
+# ActiveTx类
+
+客户端操作交易的类
+
+## 属性及构造方法
+
+包含fname、keys、Tx和saving_lock等属性
+
+```python
+def __init__(self, fname, keys):
+	self.fname = fname
+	self.keys = keys
+	try:
+		self.Tx = load(file(self.fname, "rb"))
+	except:
+		self.Tx = {}
+```
+
+## 普通方法
+
+### add方法
+
+将交易添加到Tx属性中，对应论文中的pset
+
+```python
+def add(self, Tx):
+	ptx = rscoin.Tx.parse(Tx)
+	for i, (key_id, value) in enumerate(ptx.outTx):
+		if key_id in self.keys:
+			self.Tx[(ptx.id(), i, key_id, value)] = Tx
+```
+
+### remove方法
+
+从self.Tx中移除交易
+
+### save方法
+
+调用_save方法落盘交易
+
+### _save方法
+
+调用dump方法将self.Tx存储到self.fname文件中
+
+```python
+def _save(self):
+	dump(self.Tx, file(self.fname, "wb"))
+	self.saving_lock = False
+```
+
+### balances方法
+
+存储账户
+
+```python
+def balances(self):
+	balances = defaultdict(int)
+	for(_, _, key_id, value) in self.Tx:
+		balances[keys[key_id][0]] += value
+	return balances
+```
+
+### get_value方法
+
+获取大于value的交易列表及值
+
+```python
+def get_value(self, value):
+	v = 0
+	tx = []
+	for k in self.Tx:
+		(tx_id, i, key_id, cv) = k
+		v += cv
+		tx += [ k ]
+		if v >= value:
+			break
+	return v, tx
+```
+
+# RSCfactory类
+
+创建RSC模块的工厂类
+
+## 构造方法
+
+包含defer对象
+
+```python
+def __init__(self):
+	self.should_close = False
+	self.d = defer.Deferred()
+```
+
+## 普通方法
+
+### add_to_buffer方法
+
+将line添加到发送buffer中
+
+### buildProtocol方法
+
+返回一个RSCconnection对象
+
+### clientConnectionLost方法
+
+将reason添加到self.d.errback中
+
+### clientConnectionFailed方法
+
+将reason添加到self.d.should_close中
+
+# RSCconnection类
+
+## 构造方法
+
+传入一个factory对象
+
+```python
+def __init__(self, f):
+	self.factory = f
+```
+
+## 普通方法
+
+### lineReceived方法
+
+### connectionLost方法
+
+将reason添加到self.factory.d.errback
